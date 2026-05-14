@@ -3,6 +3,10 @@
 import argparse
 import logging
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import GetPromptResult, TextContent, Tool
@@ -10,6 +14,9 @@ from mcp.types import GetPromptResult, TextContent, Tool
 from mcp_server_template.tools import handle_tool_call, list_tools
 from mcp_server_template.resources import handle_resource, list_resources
 from mcp_server_template.prompts import handle_prompt, list_prompts
+from mcp_server_template.memory.tools import handle_memory_tool_call, list_memory_tools
+from mcp_server_template.memory.resources import handle_memory_resource, list_memory_resources
+from mcp_server_template.memory.prompts import handle_memory_prompt, list_memory_prompts
 
 logger = logging.getLogger(__name__)
 
@@ -19,26 +26,36 @@ def create_server() -> Server:
 
     @server.list_tools()
     async def _list_tools() -> list[Tool]:
-        return list_tools()
+        return list_tools() + list_memory_tools()
 
     @server.call_tool()
     async def _call_tool(name: str, arguments: dict) -> list[TextContent]:
+        # Route to memory tools if applicable
+        memory_tool_names = {t.name for t in list_memory_tools()}
+        if name in memory_tool_names:
+            return await handle_memory_tool_call(name, arguments)
         return await handle_tool_call(name, arguments)
 
     @server.list_resources()
     async def _list_resources():
-        return list_resources()
+        return list_resources() + list_memory_resources()
 
     @server.read_resource()
     async def _read_resource(uri):
+        uri_str = str(uri)
+        if uri_str.startswith("memory://"):
+            return await handle_memory_resource(uri)
         return await handle_resource(uri)
 
     @server.list_prompts()
     async def _list_prompts():
-        return list_prompts()
+        return list_prompts() + list_memory_prompts()
 
     @server.get_prompt()
     async def _get_prompt(name: str, arguments: dict | None) -> GetPromptResult:
+        memory_prompt_names = {p.name for p in list_memory_prompts()}
+        if name in memory_prompt_names:
+            return await handle_memory_prompt(name, arguments)
         return await handle_prompt(name, arguments)
 
     return server
