@@ -1,0 +1,6 @@
+pymilvus
+pymilvus[model]
+pymilvus[milvus_lite]
+# pymilvus.model 0.3.x uses the transformers v4 tokenizer API (encode_plus),
+# which was removed in transformers 5.x. Pin to v4 until pymilvus.model updates.
+transformers<5

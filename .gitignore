@@ -12,3 +12,6 @@ venv/
 .python-version
 *.log
 .DS_Store
+
+# Milvus Lite experiment artifacts
+experiments/milvus_hello/*.db
