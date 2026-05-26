@@ -3,6 +3,10 @@
 import argparse
 import logging
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import GetPromptResult, TextContent, Tool

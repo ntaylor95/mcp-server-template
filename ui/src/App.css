@@ -23,7 +23,7 @@ body {
 
 .header {
   padding: 16px 24px;
-  background: #c8102e;
+  background: #1b365d;
   color: #fff;
   flex-shrink: 0;
 }
@@ -77,7 +77,7 @@ body {
 }
 
 .message.user .bubble {
-  background: #c8102e;
+  background: #004C97;
   color: #fff;
   border-bottom-right-radius: 4px;
 }
@@ -90,7 +90,7 @@ body {
 
 .message.error .bubble {
   background: #fff0f0;
-  color: #c8102e;
+  color: #004C97;
   border: 1px solid #f5c6cb;
   border-bottom-left-radius: 4px;
 }
@@ -102,7 +102,7 @@ body {
 }
 
 .source a {
-  color: #c8102e;
+  color: #004C97;
   text-decoration: none;
 }
 
@@ -166,7 +166,7 @@ body {
 }
 
 .input-area textarea:focus {
-  border-color: #c8102e;
+  border-color: #004C97;
 }
 
 .input-area textarea:disabled {
@@ -177,7 +177,7 @@ body {
 .send-btn {
   align-self: flex-end;
   padding: 10px 20px;
-  background: #c8102e;
+  background: #004C97;
   color: #fff;
   border: none;
   border-radius: 12px;
@@ -189,7 +189,7 @@ body {
 }
 
 .send-btn:hover:not(:disabled) {
-  background: #a50d26;
+  background: #1b365d;
 }
 
 .send-btn:disabled {
@@ -222,6 +222,6 @@ body {
 
 .empty-state .hint {
   font-size: 13px;
-  color: #c8102e;
+  color: #1b365d;
   opacity: 0.7;
 }
