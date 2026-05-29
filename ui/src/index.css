@@ -1,0 +1,9 @@
+/* Global reset — layout is handled in App.css */
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+}
