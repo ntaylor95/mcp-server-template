@@ -1,8 +1,12 @@
 """SSE transport for production deployment."""
 
+import asyncio
 import json
 import logging
+import multiprocessing as mp
 import os
+import tempfile
+from concurrent.futures import ProcessPoolExecutor
 
 import uvicorn
 from mcp.server import Server
@@ -27,12 +31,11 @@ _OUTPUT_FIELDS = [
 ]
 
 
-def _make_embedding_fn():
-    """Return an embedding provider that matches whatever built the Milvus DB.
+# ---------------------------------------------------------------------------
+# Embedding provider — matches whatever built the Milvus DB
+# ---------------------------------------------------------------------------
 
-    Set EMBEDDING_PROVIDER=azure_openai (requires AZURE_OPENAI_* vars) or
-    leave unset for the local pymilvus ONNX model (dim=768).
-    """
+def _make_embedding_fn():
     provider = os.environ.get("EMBEDDING_PROVIDER", "pymilvus").lower()
 
     if provider == "azure_openai":
@@ -59,19 +62,138 @@ def _make_embedding_fn():
     return milvus_model.DefaultEmbeddingFunction()
 
 
+# ---------------------------------------------------------------------------
+# Document helpers
+# Copied from milvus-document-ingestion/docling_splitter.py — keep in sync
+# until these repos are consolidated.
+# ---------------------------------------------------------------------------
+
+def convert_pdf(path: str, converter) -> str:
+    """Convert a PDF or DOCX to markdown using Docling."""
+    result = converter.convert(path)
+    return result.document.export_to_markdown()
+
+
+def _check_access(url: str, user_token: str | None) -> bool:
+    """Return True if the current user can read this document.
+
+    Local paths (POC test data): check the file exists on disk.
+    SharePoint URLs: placeholder — always grants access for now.
+    TODO: attempt a HEAD request with user_token; return False on 403/401.
+    """
+    if url.startswith("/"):
+        return os.path.exists(url)
+    return True  # placeholder
+
+
+async def _fetch_document(url: str, document_id: str) -> bytes:
+    """Return raw document bytes.
+
+    Local path (POC test data): read from disk.
+    SharePoint URL: download via the Graph API using the caller's SSO token.
+    """
+    if url.startswith("/"):
+        with open(url, "rb") as f:
+            return f.read()
+    from mcp_server_template import sharepoint  # noqa: PLC0415
+    return await sharepoint.download_file(document_id)
+
+
+# ---------------------------------------------------------------------------
+# Docling subprocess worker
+# Runs in a spawned process to avoid gRPC fork conflicts on macOS.
+# Module-level functions are required for pickling by ProcessPoolExecutor.
+# ---------------------------------------------------------------------------
+
+_docling_converter = None  # lives only in the worker process
+
+
+def _init_docling_worker():
+    """Initialiser — runs once per worker process when the pool starts."""
+    global _docling_converter
+    from docling.document_converter import DocumentConverter  # noqa: PLC0415
+    _docling_converter = DocumentConverter()
+
+
+def _docling_worker(doc_bytes: bytes, filename: str) -> str:
+    """Convert document bytes to markdown. Runs in the spawned worker process."""
+    suffix = os.path.splitext(filename)[-1] or ".pdf"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+        f.write(doc_bytes)
+        tmp_path = f.name
+    try:
+        return convert_pdf(tmp_path, _docling_converter)
+    finally:
+        os.unlink(tmp_path)
+
+
+def _ask_llm(markdown: str, question: str, client, deployment: str, max_tokens: int) -> str:
+    """Send document markdown + question to the LLM and return the answer."""
+    # gpt-4.1-nano has a 1M token context window; 300k chars (~75k tokens) is
+    # a safe practical limit that leaves headroom for the prompt and output.
+    MAX_CHARS = 300_000
+    if len(markdown) > MAX_CHARS:
+        logger.warning("Document truncated from %d to %d chars for LLM", len(markdown), MAX_CHARS)
+        markdown = markdown[:MAX_CHARS]
+
+    resp = client.chat.completions.create(
+        model=deployment,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a helpful policy assistant for Tricentis employees. "
+                    "Answer the question using only the document provided. "
+                    "Be specific and concise. Cite specific values, dates, or section names "
+                    "when they are relevant to the answer. "
+                    "If the document does not contain the answer, say so clearly."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"Document:\n\n{markdown}\n\nQuestion: {question}",
+            },
+        ],
+        max_tokens=max_tokens,
+    )
+    return resp.choices[0].message.content
+
+
+# ---------------------------------------------------------------------------
+# Server
+# ---------------------------------------------------------------------------
+
 def run_sse_server(server: Server, host: str = "0.0.0.0", port: int = 8000):
     sse = SseServerTransport("/messages/")
 
-    # Initialise once at startup — MilvusClient holds the file lock for the
-    # lifetime of the process; embedding client is created once and reused.
+    # Initialise once at startup
     db_path = os.environ.get("MILVUS_DB_PATH", "")
     collection = os.environ.get("MILVUS_COLLECTION", "hr")
     embedding_fn = _make_embedding_fn()
     milvus_client = MilvusClient(db_path) if db_path else None
 
+    # Spawn a dedicated worker process for Docling so it never forks while
+    # Milvus Lite's gRPC threads are active (fork + gRPC = crash on macOS).
+    logger.info("Starting Docling worker process...")
+    docling_pool = ProcessPoolExecutor(
+        max_workers=1,
+        mp_context=mp.get_context("spawn"),
+        initializer=_init_docling_worker,
+    )
+    # Eagerly warm up the worker so the first request isn't slow.
+    docling_pool.submit(lambda: None)
+    logger.info("Docling worker started.")
+
+    from openai import AzureOpenAI  # noqa: PLC0415
+    chat_client = AzureOpenAI(
+        api_key=os.environ["AZURE_OPENAI_API_KEY"],
+        azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
+        api_version=os.environ.get("AZURE_OPENAI_CHAT_API_VERSION", "2024-12-01-preview"),
+    )
+    chat_deployment = os.environ["AZURE_OPENAI_CHAT_DEPLOYMENT"]
+    chat_max_tokens = int(os.environ.get("AZURE_OPENAI_CHAT_MAX_TOKENS", "1000"))
+
     async def handle_sse(request: Request):
-        # Extract the caller's Bearer token and place it in the request context
-        # so that tool handlers can use it for the OBO exchange when AUTH_MODE=obo.
         raw = request.headers.get("Authorization", "")
         token = raw[len("Bearer "):].strip() if raw.startswith("Bearer ") else None
         auth.set_user_token(token)
@@ -105,7 +227,9 @@ def run_sse_server(server: Server, host: str = "0.0.0.0", port: int = 8000):
             return JSONResponse({"error": "MILVUS_DB_PATH is not configured"}, status_code=503)
 
         logger.info("ask: %s", question)
+        user_token = auth._user_token_var.get(None)
 
+        # 1. Embed and search Milvus
         vector = embedding_fn.encode_queries([question])[0]
         ann_params = {"metric_type": "L2", "params": {}}
 
@@ -145,14 +269,51 @@ def run_sse_server(server: Server, host: str = "0.0.0.0", port: int = 8000):
         if not merged:
             return JSONResponse({"answer": "No relevant policy found.", "source": None})
 
-        top = merged[0]
-        subject = top["entity"].get("subject", "")
-        url = top["entity"].get("sharepoint_url", "")
-        logger.info("top result: %s  dist=%.4f  url=%s", subject, top["distance"], url)
+        # 2. Try each candidate: access check → fetch → Docling → LLM
+        for candidate in merged:
+            url = candidate["entity"].get("sharepoint_url", "")
+            document_id = candidate["entity"].get("document_id", "")
+            subject = candidate["entity"].get("subject", "")
+
+            if not _check_access(url, user_token):
+                logger.info("access denied for document '%s', trying next", subject)
+                continue
+
+            try:
+                doc_bytes = await _fetch_document(url, document_id)
+            except PermissionError:
+                logger.info("permission denied fetching '%s', trying next", subject)
+                continue
+            except Exception as e:
+                logger.warning("failed to fetch '%s': %s", subject, e)
+                continue
+
+            try:
+                loop = asyncio.get_running_loop()
+                markdown = await loop.run_in_executor(
+                    docling_pool, _docling_worker, doc_bytes, url
+                )
+            except Exception as e:
+                logger.warning("Docling failed for '%s': %s", subject, e)
+                continue
+
+            logger.info(
+                "answering from '%s' (dist=%.4f, %d markdown chars)",
+                subject, candidate["distance"], len(markdown),
+            )
+
+            answer = await asyncio.to_thread(
+                _ask_llm, markdown, question, chat_client, chat_deployment, chat_max_tokens
+            )
+
+            return JSONResponse({
+                "answer": answer,
+                "source": {"name": subject, "url": url} if url else None,
+            })
 
         return JSONResponse({
-            "answer": subject,
-            "source": {"name": subject, "url": url} if url else None,
+            "answer": "No accessible policy document was found for your question.",
+            "source": None,
         })
 
     middleware = [
